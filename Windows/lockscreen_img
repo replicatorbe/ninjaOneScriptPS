@@ -1,0 +1,245 @@
+# Script basé sur la méthode PersonalizationCSP
+# Adapté pour télécharger depuis une URL et forcer le lockscreen
+# Scritp récupére image et affiche en fond d'écran verrouillage (pas fond ecran windows)
+
+param(
+    [string]$ImageUrl = "https://url/tools/screen.png",
+    [string]$LogPath = "$env:TEMP"
+)
+
+#Requires -RunAsAdministrator
+
+# Logging
+if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+    Start-Transcript -Path "$($LogPath)\LockScreen_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+}
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "=== SCRIPT LOCKSCREEN PROFESSIONNEL ===" -ForegroundColor Magenta
+Write-Host "URL Source : $ImageUrl" -ForegroundColor Cyan
+Write-Host "Méthode : PersonalizationCSP + Désactivation Spotlight" -ForegroundColor Yellow
+
+try {
+    # 1. Télécharger l'image
+    Write-Host "`n1. Téléchargement de l'image..." -ForegroundColor Yellow
+    
+    $TempImage = "$env:TEMP\lockscreen_download.jpg"
+    $LockScreenImageValue = "C:\Windows\System32\LockScreen.jpg"
+    
+    Invoke-WebRequest -Uri $ImageUrl -OutFile $TempImage -UseBasicParsing
+    Write-Host "✅ Image téléchargée vers : $TempImage" -ForegroundColor Green
+    
+    # Vérifier la taille du fichier
+    $FileSize = (Get-Item $TempImage).Length
+    Write-Host "Taille du fichier : $FileSize bytes" -ForegroundColor Cyan
+    
+    if ($FileSize -lt 1000) {
+        throw "Fichier trop petit, probablement une erreur de téléchargement"
+    }
+
+    # 2. Copier l'image vers le dossier système
+    Write-Host "`n2. Installation de l'image système..." -ForegroundColor Yellow
+    
+    # S'assurer que le dossier System32 est accessible
+    if (-not (Test-Path "C:\Windows\System32")) {
+        throw "Impossible d'accéder au dossier System32"
+    }
+    
+    Copy-Item $TempImage $LockScreenImageValue -Force
+    Write-Host "✅ Image copiée vers : $LockScreenImageValue" -ForegroundColor Green
+    
+    # Vérifier que la copie a réussi
+    if (-not (Test-Path $LockScreenImageValue)) {
+        throw "Échec de la copie vers System32"
+    }
+    
+    $CopiedSize = (Get-Item $LockScreenImageValue).Length
+    Write-Host "Taille copiée : $CopiedSize bytes" -ForegroundColor Cyan
+
+    # 3. ÉTAPE CRITIQUE : Désactiver Windows Spotlight AVANT de configurer PersonalizationCSP
+    Write-Host "`n3. Désactivation de Windows Spotlight..." -ForegroundColor Yellow
+    
+    # Désactiver au niveau système via Group Policy
+    $SpotlightPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"
+    if (-not (Test-Path $SpotlightPolicyPath)) {
+        New-Item -Path $SpotlightPolicyPath -Force | Out-Null
+    }
+    
+    $SpotlightPolicies = @{
+        "DisableWindowsSpotlightFeatures" = 1
+        "DisableWindowsSpotlightOnActionCenter" = 1
+        "DisableWindowsSpotlightOnSettings" = 1
+        "DisableWindowsSpotlightWindowsWelcomeExperience" = 1
+        "DisableSoftLanding" = 1
+    }
+    
+    foreach ($policy in $SpotlightPolicies.GetEnumerator()) {
+        Set-ItemProperty -Path $SpotlightPolicyPath -Name $policy.Key -Value $policy.Value -Type DWORD -Force
+        Write-Host "Policy $($policy.Key) = $($policy.Value)" -ForegroundColor Gray
+    }
+    
+    Write-Host "✅ Windows Spotlight désactivé au niveau système" -ForegroundColor Green
+
+    # 4. Configuration PersonalizationCSP (méthode professionnelle)
+    Write-Host "`n4. Configuration PersonalizationCSP..." -ForegroundColor Yellow
+    
+    $RegKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    $LockScreenPath = "LockScreenImagePath"
+    $LockScreenStatus = "LockScreenImageStatus"
+    $LockScreenUrl = "LockScreenImageUrl"
+    $StatusValue = "1"
+    
+    # Créer la clé de registre si elle n'existe pas
+    if (-not (Test-Path $RegKeyPath)) {
+        Write-Host "Création de la clé de registre $RegKeyPath"
+        New-Item -Path $RegKeyPath -Force | Out-Null
+    }
+    
+    # Configurer les valeurs de registre pour le lockscreen
+    Write-Host "Configuration des entrées de registre pour Lock Screen..."
+    
+    New-ItemProperty -Path $RegKeyPath -Name $LockScreenStatus -Value $StatusValue -PropertyType DWORD -Force | Out-Null
+    Write-Host "✓ $LockScreenStatus = $StatusValue" -ForegroundColor Gray
+    
+    New-ItemProperty -Path $RegKeyPath -Name $LockScreenPath -Value $LockScreenImageValue -PropertyType STRING -Force | Out-Null
+    Write-Host "✓ $LockScreenPath = $LockScreenImageValue" -ForegroundColor Gray
+    
+    New-ItemProperty -Path $RegKeyPath -Name $LockScreenUrl -Value $LockScreenImageValue -PropertyType STRING -Force | Out-Null
+    Write-Host "✓ $LockScreenUrl = $LockScreenImageValue" -ForegroundColor Gray
+    
+    Write-Host "✅ PersonalizationCSP configuré" -ForegroundColor Green
+
+    # 5. Désactiver Spotlight pour les utilisateurs existants
+    Write-Host "`n5. Configuration utilisateurs..." -ForegroundColor Yellow
+    
+    # Obtenir tous les profils utilisateur
+    $UserProfiles = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" | 
+        Where-Object { $_.PSChildName -match "S-1-5-21" -and (Test-Path $_.ProfileImagePath) }
+    
+    foreach ($Profile in $UserProfiles) {
+        try {
+            $UserSID = $Profile.PSChildName
+            $UserRegPath = "HKU:\$UserSID"
+            
+            # Charger la ruche utilisateur si nécessaire
+            if (-not (Test-Path $UserRegPath)) {
+                $NTUserPath = Join-Path $Profile.ProfileImagePath "NTUSER.DAT"
+                if (Test-Path $NTUserPath) {
+                    reg load "HKU\$UserSID" "`"$NTUserPath`"" 2>$null
+                }
+            }
+            
+            if (Test-Path $UserRegPath) {
+                $UserCDMPath = "$UserRegPath\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+                if (-not (Test-Path $UserCDMPath)) {
+                    New-Item -Path $UserCDMPath -Force | Out-Null
+                }
+                
+                # Désactiver Spotlight pour cet utilisateur
+                $SpotlightSettings = @{
+                    "RotatingLockScreenEnabled" = 0
+                    "RotatingLockScreenOverlayEnabled" = 0
+                    "SubscribedContent-338387Enabled" = 0
+                    "SubscribedContent-338393Enabled" = 0
+                }
+                
+                foreach ($setting in $SpotlightSettings.GetEnumerator()) {
+                    Set-ItemProperty -Path $UserCDMPath -Name $setting.Key -Value $setting.Value -Type DWORD -Force
+                }
+                
+                Write-Host "✓ Utilisateur $UserSID configuré" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Host "⚠️ Erreur utilisateur $UserSID : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    
+    Write-Host "✅ Utilisateurs configurés" -ForegroundColor Green
+
+    # 6. Forcer la mise à jour des Group Policy
+    Write-Host "`n6. Application des changements..." -ForegroundColor Yellow
+    
+    # Group Policy update
+    Write-Host "Mise à jour des Group Policy..."
+    $GPResult = gpupdate /force 2>&1
+    Write-Host "GP Update: $GPResult" -ForegroundColor Gray
+    
+    # Redémarrer les services liés aux thèmes
+    $ServicesToRestart = @("Themes", "UxSms")
+    foreach ($ServiceName in $ServicesToRestart) {
+        try {
+            $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($Service -and $Service.Status -eq 'Running') {
+                Restart-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+                Write-Host "✓ Service $ServiceName redémarré" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Host "⚠️ Service $ServiceName non redémarrable" -ForegroundColor Yellow
+        }
+    }
+    
+    Write-Host "✅ Services redémarrés" -ForegroundColor Green
+
+    # 7. Vérifications finales
+    Write-Host "`n7. Vérifications finales..." -ForegroundColor Yellow
+    
+    # Vérifier que l'image existe
+    if (Test-Path $LockScreenImageValue) {
+        $FinalSize = (Get-Item $LockScreenImageValue).Length
+        Write-Host "✅ Image finale présente : $LockScreenImageValue ($FinalSize bytes)" -ForegroundColor Green
+    } else {
+        Write-Host "❌ Image finale absente !" -ForegroundColor Red
+    }
+    
+    # Vérifier les clés de registre
+    if (Test-Path $RegKeyPath) {
+        $RegValues = Get-ItemProperty -Path $RegKeyPath
+        Write-Host "✅ Clés de registre présentes :" -ForegroundColor Green
+        Write-Host "   LockScreenImageStatus = $($RegValues.LockScreenImageStatus)" -ForegroundColor Gray
+        Write-Host "   LockScreenImagePath = $($RegValues.LockScreenImagePath)" -ForegroundColor Gray
+    }
+
+    # 8. Instructions finales
+    Write-Host "`n🎉 CONFIGURATION TERMINÉE AVEC SUCCÈS !" -ForegroundColor Green
+    Write-Host "`n📋 RÉSUMÉ :" -ForegroundColor Yellow
+    Write-Host "   • Image téléchargée depuis : $ImageUrl" -ForegroundColor White
+    Write-Host "   • Image installée dans : $LockScreenImageValue" -ForegroundColor White  
+    Write-Host "   • Windows Spotlight désactivé" -ForegroundColor White
+    Write-Host "   • PersonalizationCSP configuré" -ForegroundColor White
+    Write-Host "   • Group Policy appliquées" -ForegroundColor White
+
+    Write-Host "`n🧪 TESTS :" -ForegroundColor Magenta
+    Write-Host "1. Testez immédiatement : Windows + L" -ForegroundColor White
+    Write-Host "2. Si l'ancienne image persiste, attendez 2-3 minutes" -ForegroundColor White
+    Write-Host "3. En dernier recours : redémarrez l'ordinateur" -ForegroundColor White
+    
+    Write-Host "`n💡 DÉPANNAGE :" -ForegroundColor Cyan
+    Write-Host "Si ça ne marche toujours pas :" -ForegroundColor White
+    Write-Host "• Vérifiez dans Paramètres > Personnalisation > Écran de verrouillage" -ForegroundColor Gray
+    Write-Host "• Assurez-vous que 'Image' est sélectionné (pas 'Windows à la une')" -ForegroundColor Gray
+    Write-Host "• L'image devrait être automatiquement sélectionnée" -ForegroundColor Gray
+
+} catch {
+    Write-Host "`n❌ ERREUR : $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Détails : $($_.Exception.GetType().FullName)" -ForegroundColor Red
+    Write-Host "Ligne : $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+    
+    # En cas d'erreur, essayer de nettoyer
+    if (Test-Path $TempImage) {
+        Remove-Item $TempImage -Force -ErrorAction SilentlyContinue
+    }
+    
+    throw
+}
+
+# Nettoyer les fichiers temporaires
+if (Test-Path $TempImage) {
+    Remove-Item $TempImage -Force -ErrorAction SilentlyContinue
+}
+
+if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+    Stop-Transcript
+}
