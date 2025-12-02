@@ -1,0 +1,516 @@
+#Requires -Version 5.1
+
+# ============================================================================
+# RÉCUPÉRATION DES PARAMÈTRES NINJAONE
+# ============================================================================
+
+$RawParams = $args[0]
+Write-Host "RawParams: $RawParams"
+
+if ($RawParams -match '^\{.*\}$') {
+    Write-Host "Format JSON detecte, parsing..."
+    $RawParams = $RawParams -replace '^\{', '' -replace '\}$', ''
+    $pairs = $RawParams -split ','
+    foreach ($pair in $pairs) {
+        $kv = $pair -split ':', 2
+        if ($kv.Count -eq 2) {
+            $key = $kv[0].Trim()
+            $value = $kv[1].Trim()
+            # Nettoyer les backslashes d'échappement JSON
+            $value = $value -replace '\\/', '/'
+            $value = $value.Trim('"').Trim("'")
+            Write-Host "  $key = $value"
+            Set-Variable -Name $key -Value $value -Scope Script
+        }
+    }
+}
+
+Write-Host "Title: $script:title"
+Write-Host "Message: $script:message"
+Write-Host "Token: $script:token"
+Write-Host "ShowForm: $script:showForm"
+
+# Valeurs par défaut
+if ([String]::IsNullOrWhiteSpace($script:title)) { $script:title = "Information" }
+if ([String]::IsNullOrWhiteSpace($script:message)) { $script:message = "Veuillez contacter le service informatique du Roeulx!" }
+if ([String]::IsNullOrWhiteSpace($script:showForm)) { $script:showForm = "false" }
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+$config = @{
+    ScriptFolder = "C:\RoeulxIT\Notifications"
+    TaskPrefix   = "RoeulxNotif"
+    TaskTimeout  = 320
+    CleanupDelay = 15
+    ApiBaseUrl   = "https://url/api/ticket_question_response.php"
+}
+
+if (-not (Test-Path $config.ScriptFolder)) {
+    New-Item -Path $config.ScriptFolder -ItemType Directory -Force | Out-Null
+    Write-Host "[INFO] Dossier cree: $($config.ScriptFolder)"
+}
+
+# ============================================================================
+# NETTOYAGE DES TÂCHES ORPHELINES
+# ============================================================================
+
+Write-Host "[CLEANUP] Nettoyage des taches orphelines..."
+Get-ScheduledTask -TaskName "$($config.TaskPrefix)*" -ErrorAction SilentlyContinue | ForEach-Object {
+    $taskAge = (Get-Date) - $_.Date
+    if ($taskAge.TotalMinutes -gt 10) {
+        Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+Get-ChildItem -Path $config.ScriptFolder -Filter "notify_*.ps1" -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.LastWriteTime -lt (Get-Date).AddHours(-1)) {
+        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Get-ChildItem -Path $config.ScriptFolder -Filter "notify_*.vbs" -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.LastWriteTime -lt (Get-Date).AddHours(-1)) {
+        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================================
+# SCRIPT DE NOTIFICATION (DESIGN PRO AVEC #8FBF7F)
+# ============================================================================
+
+$titleEscaped = [System.Security.SecurityElement]::Escape($script:title)
+$messageEscaped = [System.Security.SecurityElement]::Escape($script:message)
+$tokenEscaped = $script:token
+$showFormFlag = $script:showForm
+$apiUrl = $config.ApiBaseUrl
+
+$formHeight = if ($showFormFlag -eq "true") { "360" } else { "160" }
+
+$notificationScript = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Fonction native pour encoder URL (sans System.Web)
+function Encode-Url {
+    param([string]`$text)
+    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$text)
+    `$encoded = ""
+    foreach (`$byte in `$bytes) {
+        if ((`$byte -ge 48 -and `$byte -le 57) -or
+            (`$byte -ge 65 -and `$byte -le 90) -or
+            (`$byte -ge 97 -and `$byte -le 122) -or
+            `$byte -eq 45 -or `$byte -eq 46 -or
+            `$byte -eq 95 -or `$byte -eq 126) {
+            `$encoded += [char]`$byte
+        } else {
+            `$encoded += "%{0:X2}" -f `$byte
+        }
+    }
+    return `$encoded
+}
+
+# Configuration
+`$showForm = '$showFormFlag' -eq 'true'
+`$formHeight = if (`$showForm) { 360 } else { 160 }
+`$apiBaseUrl = '$apiUrl'
+`$tokenValue = '$tokenEscaped'
+
+# Couleurs du thème
+`$primaryColor = [System.Drawing.Color]::FromArgb(143, 191, 127)
+`$primaryDark = [System.Drawing.Color]::FromArgb(115, 163, 102)
+`$primaryLight = [System.Drawing.Color]::FromArgb(165, 207, 151)
+`$accentColor = [System.Drawing.Color]::FromArgb(100, 149, 237)
+`$backgroundColor = [System.Drawing.Color]::FromArgb(250, 252, 250)
+`$textDark = [System.Drawing.Color]::FromArgb(45, 55, 45)
+
+# Formulaire principal avec ombre
+`$form = New-Object System.Windows.Forms.Form
+`$form.FormBorderStyle = 'None'
+`$form.BackColor = `$backgroundColor
+`$form.Size = New-Object System.Drawing.Size(500, `$formHeight)
+`$form.TopMost = `$true
+`$form.ShowInTaskbar = `$false
+`$form.StartPosition = 'Manual'
+`$form.Opacity = 0
+
+# Position en bas à droite avec marge
+`$screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+`$form.Location = New-Object System.Drawing.Point((`$screen.Width - 510), (`$screen.Height - `$formHeight - 10))
+
+# ===== HEADER AVEC DÉGRADÉ =====
+`$headerPanel = New-Object System.Windows.Forms.Panel
+`$headerPanel.Location = New-Object System.Drawing.Point(0, 0)
+`$headerPanel.Size = New-Object System.Drawing.Size(500, 85)
+`$headerPanel.BackColor = `$primaryColor
+`$form.Controls.Add(`$headerPanel)
+
+# Icône avec cercle
+`$iconCircle = New-Object System.Windows.Forms.Panel
+`$iconCircle.Location = New-Object System.Drawing.Point(20, 20)
+`$iconCircle.Size = New-Object System.Drawing.Size(45, 45)
+`$iconCircle.BackColor = [System.Drawing.Color]::White
+`$headerPanel.Controls.Add(`$iconCircle)
+
+`$iconLabel = New-Object System.Windows.Forms.Label
+`$iconLabel.Location = New-Object System.Drawing.Point(7, 5)
+`$iconLabel.Size = New-Object System.Drawing.Size(30, 35)
+`$iconLabel.Font = New-Object System.Drawing.Font('Segoe UI Emoji', 20)
+`$iconLabel.Text = '💬'
+`$iconLabel.BackColor = [System.Drawing.Color]::Transparent
+`$iconLabel.TextAlign = 'MiddleCenter'
+`$iconCircle.Controls.Add(`$iconLabel)
+
+# Titre header principal
+`$headerTitle = New-Object System.Windows.Forms.Label
+`$headerTitle.Location = New-Object System.Drawing.Point(75, 20)
+`$headerTitle.Size = New-Object System.Drawing.Size(400, 28)
+`$headerTitle.Font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
+`$headerTitle.Text = 'Le Service Informatique du Rœulx'
+`$headerTitle.ForeColor = [System.Drawing.Color]::White
+`$headerTitle.BackColor = [System.Drawing.Color]::Transparent
+`$headerPanel.Controls.Add(`$headerTitle)
+
+# Sous-titre header
+`$headerSubtitle = New-Object System.Windows.Forms.Label
+`$headerSubtitle.Location = New-Object System.Drawing.Point(75, 50)
+`$headerSubtitle.Size = New-Object System.Drawing.Size(400, 22)
+`$headerSubtitle.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+`$headerSubtitle.Text = if (`$showForm) { 'sollicite votre retour' } else { 'vous informe' }
+`$headerSubtitle.ForeColor = [System.Drawing.Color]::FromArgb(240, 250, 240)
+`$headerSubtitle.BackColor = [System.Drawing.Color]::Transparent
+`$headerPanel.Controls.Add(`$headerSubtitle)
+
+# ===== CORPS DU MESSAGE =====
+`$contentPanel = New-Object System.Windows.Forms.Panel
+`$contentPanel.Location = New-Object System.Drawing.Point(0, 85)
+`$contentPanelHeight = if (`$showForm) { 275 } else { 75 }
+`$contentPanel.Size = New-Object System.Drawing.Size(500, `$contentPanelHeight)
+`$contentPanel.BackColor = `$backgroundColor
+`$form.Controls.Add(`$contentPanel)
+
+# Titre du message (question/info)
+`$titleLabel = New-Object System.Windows.Forms.Label
+`$titleLabel.Location = New-Object System.Drawing.Point(25, 20)
+`$titleLabel.Size = New-Object System.Drawing.Size(440, 30)
+`$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+`$titleLabel.Text = '$titleEscaped'
+`$titleLabel.ForeColor = `$textDark
+`$contentPanel.Controls.Add(`$titleLabel)
+
+# Message principal
+`$messageLabel = New-Object System.Windows.Forms.Label
+`$messageLabel.Location = New-Object System.Drawing.Point(25, 55)
+`$messageHeight = if (`$showForm) { 35 } else { 45 }
+`$messageLabel.Size = New-Object System.Drawing.Size(440, `$messageHeight)
+`$messageLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+`$messageLabel.Text = '$messageEscaped'
+`$messageLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 90, 80)
+`$contentPanel.Controls.Add(`$messageLabel)
+
+# Si formulaire activé
+if (`$showForm) {
+    # Label pour textarea
+    `$responseLabel = New-Object System.Windows.Forms.Label
+    `$responseLabel.Location = New-Object System.Drawing.Point(25, 100)
+    `$responseLabel.Size = New-Object System.Drawing.Size(440, 22)
+    `$responseLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    `$responseLabel.Text = '✍️ Votre réponse :'
+    `$responseLabel.ForeColor = `$textDark
+    `$contentPanel.Controls.Add(`$responseLabel)
+    
+    # Textarea avec bordure stylisée
+    `$responseBox = New-Object System.Windows.Forms.TextBox
+    `$responseBox.Location = New-Object System.Drawing.Point(25, 125)
+    `$responseBox.Size = New-Object System.Drawing.Size(450, 85)
+    `$responseBox.Multiline = `$true
+    `$responseBox.ScrollBars = 'Vertical'
+    `$responseBox.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    `$responseBox.BorderStyle = 'FixedSingle'
+    `$responseBox.BackColor = [System.Drawing.Color]::White
+    `$responseBox.MaxLength = 2000
+    `$contentPanel.Controls.Add(`$responseBox)
+    
+    # Bouton Envoyer
+    `$sendBtn = New-Object System.Windows.Forms.Button
+    `$sendBtn.Location = New-Object System.Drawing.Point(25, 220)
+    `$sendBtn.Size = New-Object System.Drawing.Size(220, 40)
+    `$sendBtn.Text = '📤 Envoyer ma réponse'
+    `$sendBtn.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    `$sendBtn.ForeColor = [System.Drawing.Color]::White
+    `$sendBtn.BackColor = `$primaryColor
+    `$sendBtn.FlatStyle = 'Flat'
+    `$sendBtn.FlatAppearance.BorderSize = 0
+    `$sendBtn.FlatAppearance.BorderColor = `$primaryDark
+    `$sendBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    `$sendBtn.Add_Click({
+        # Validation
+        `$responseText = `$responseBox.Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace(`$responseText)) {
+            [System.Windows.Forms.MessageBox]::Show('Veuillez entrer une réponse avant d''envoyer.', 'Champ requis', 'OK', 'Warning')
+            return
+        }
+        
+        if (`$responseText.Length -lt 10) {
+            [System.Windows.Forms.MessageBox]::Show('Veuillez fournir une réponse plus détaillée (au moins 10 caractères).', 'Réponse trop courte', 'OK', 'Warning')
+            return
+        }
+        
+        `$sendBtn.Enabled = `$false
+        `$sendBtn.Text = '⏳ Envoi en cours...'
+        `$cancelBtn.Enabled = `$false
+        
+        try {
+            # Construire l'URL complète
+            `$fullUrl = "{0}?token={1}" -f `$apiBaseUrl, `$tokenValue
+            
+            # Encoder la réponse
+            `$encodedResponse = Encode-Url `$responseText
+            `$postBody = "response={0}" -f `$encodedResponse
+            
+            # Envoyer le POST
+            `$webResponse = Invoke-WebRequest -Uri `$fullUrl ``
+                -Method Post ``
+                -Body `$postBody ``
+                -ContentType 'application/x-www-form-urlencoded; charset=utf-8' ``
+                -TimeoutSec 15 ``
+                -UseBasicParsing ``
+                -ErrorAction Stop
+            
+            # Succès
+            `$sendBtn.Text = '✓ Réponse envoyée !'
+            `$sendBtn.BackColor = [System.Drawing.Color]::FromArgb(40, 167, 69)
+            `$responseBox.Enabled = `$false
+            `$cancelBtn.Text = 'Fermer'
+            `$cancelBtn.Enabled = `$true
+            
+            [System.Windows.Forms.MessageBox]::Show('Votre réponse a été envoyée avec succès !`n`nMerci pour votre retour.', 'Envoi réussi', 'OK', 'Information')
+            
+            Start-Sleep -Seconds 1
+            `$form.Close()
+            
+        } catch {
+            `$sendBtn.Enabled = `$true
+            `$sendBtn.Text = '📤 Envoyer ma réponse'
+            `$cancelBtn.Enabled = `$true
+            
+            `$errorMsg = `$_.Exception.Message
+            if (`$_.Exception.Response) {
+                try {
+                    `$statusCode = [int]`$_.Exception.Response.StatusCode
+                    `$errorMsg += "`nCode HTTP: `$statusCode"
+                } catch {}
+            }
+            
+            [System.Windows.Forms.MessageBox]::Show("Erreur lors de l'envoi de votre réponse:`n`n`$errorMsg`n`nVeuillez réessayer ou contactez l'informatique via l'intranet.", 'Erreur de connexion', 'OK', 'Error')
+        }
+    })
+    `$sendBtn.Add_MouseEnter({
+        if (`$sendBtn.Enabled) {
+            `$sendBtn.BackColor = `$primaryDark
+        }
+    })
+    `$sendBtn.Add_MouseLeave({
+        if (`$sendBtn.Enabled) {
+            `$sendBtn.BackColor = `$primaryColor
+        }
+    })
+    `$contentPanel.Controls.Add(`$sendBtn)
+    
+    # Bouton Annuler
+    `$cancelBtn = New-Object System.Windows.Forms.Button
+    `$cancelBtn.Location = New-Object System.Drawing.Point(255, 220)
+    `$cancelBtn.Size = New-Object System.Drawing.Size(120, 40)
+    `$cancelBtn.Text = 'Annuler'
+    `$cancelBtn.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    `$cancelBtn.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
+    `$cancelBtn.BackColor = [System.Drawing.Color]::White
+    `$cancelBtn.FlatStyle = 'Flat'
+    `$cancelBtn.FlatAppearance.BorderSize = 1
+    `$cancelBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+    `$cancelBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    `$cancelBtn.Add_Click({`$form.Close()})
+    `$cancelBtn.Add_MouseEnter({
+        `$cancelBtn.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    })
+    `$cancelBtn.Add_MouseLeave({
+        `$cancelBtn.BackColor = [System.Drawing.Color]::White
+    })
+    `$contentPanel.Controls.Add(`$cancelBtn)
+}
+
+# Bouton fermer (X)
+`$closeBtn = New-Object System.Windows.Forms.Button
+`$closeBtn.Location = New-Object System.Drawing.Point(460, 10)
+`$closeBtn.Size = New-Object System.Drawing.Size(30, 30)
+`$closeBtn.Text = '×'
+`$closeBtn.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+`$closeBtn.ForeColor = [System.Drawing.Color]::White
+`$closeBtn.BackColor = [System.Drawing.Color]::Transparent
+`$form.FlatStyle = 'Flat'
+`$closeBtn.FlatAppearance.BorderSize = 0
+`$closeBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+`$closeBtn.Add_Click({`$form.Close()})
+`$closeBtn.Add_MouseEnter({
+    `$closeBtn.BackColor = [System.Drawing.Color]::FromArgb(220, 53, 69)
+})
+`$closeBtn.Add_MouseLeave({
+    `$closeBtn.BackColor = [System.Drawing.Color]::Transparent
+})
+`$headerPanel.Controls.Add(`$closeBtn)
+
+# Bordure et ombre
+`$form.Paint.Add({
+    param(`$s, `$e)
+    `$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(143, 191, 127), 2)
+    `$e.Graphics.DrawRectangle(`$pen, 0, 0, `$form.Width - 1, `$form.Height - 1)
+    `$pen.Dispose()
+})
+
+# Fermeture auto (seulement si pas de formulaire)
+if (-not `$showForm) {
+    `$timer = New-Object System.Windows.Forms.Timer
+    `$timer.Interval = 60000
+    `$timer.Add_Tick({
+        for (`$i = 10; `$i -ge 0; `$i--) {
+            `$form.Opacity = `$i / 10
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 30
+        }
+        `$form.Close()
+        `$timer.Stop()
+    })
+    `$timer.Start()
+}
+
+# Afficher la form
+`$form.Show()
+
+# Animation d'entrée fluide
+for (`$i = 0; `$i -le 10; `$i++) {
+    `$form.Opacity = `$i / 10
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 40
+}
+
+# Son de notification
+[System.Media.SystemSounds]::Asterisk.Play()
+
+# Boucle de message
+[void][System.Windows.Forms.Application]::Run(`$form)
+"@
+
+# ============================================================================
+# ENVOI AUX UTILISATEURS
+# ============================================================================
+
+Write-Host "[INFO] Recuperation des utilisateurs connectes..."
+$loggedUsers = @()
+
+try {
+    $sessions = quser 2>$null | Select-Object -Skip 1
+    foreach ($session in $sessions) {
+        if ($session -match '^\s*(\S+)\s+') {
+            $username = $Matches[1] -replace '>', ''
+            if ($username -ne 'SYSTEM' -and $username -notlike 'DWM-*') {
+                $loggedUsers += $username
+                Write-Host "  -> Utilisateur trouve: $username"
+            }
+        }
+    }
+} catch {
+    Write-Host "[WARN] Impossible de recuperer les utilisateurs"
+}
+
+if ($loggedUsers.Count -eq 0) {
+    Write-Host "[WARN] Aucun utilisateur connecte"
+    exit 0
+}
+
+$createdTasks = @()
+
+foreach ($user in $loggedUsers) {
+    try {
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $taskName = "$($config.TaskPrefix)_$user`_$timestamp"
+        $scriptPath = Join-Path $config.ScriptFolder "notify_$user`_$timestamp.ps1"
+        $vbsPath = Join-Path $config.ScriptFolder "notify_$user`_$timestamp.vbs"
+        
+        $notificationScript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+        
+        $vbsContent = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File ""$scriptPath""", 0, False
+"@
+        $vbsContent | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+        
+        Write-Host "[TASK] Creation de la tache pour: $user"
+        
+        $action = New-ScheduledTaskAction -Execute "wscript.exe" `
+            -Argument "`"$vbsPath`" //B //Nologo"
+        
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+        
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Seconds $config.TaskTimeout)
+        
+        $task = Register-ScheduledTask -TaskName $taskName `
+            -Action $action `
+            -Principal $principal `
+            -Settings $settings `
+            -Force
+        
+        if ($task) {
+            $createdTasks += @{
+                Name       = $taskName
+                User       = $user
+                ScriptPath = $scriptPath
+                VbsPath    = $vbsPath
+            }
+            Write-Host "  [OK] Tache lancee"
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        }
+        
+    } catch {
+        Write-Host "  [ERROR] Echec: $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
+# NETTOYAGE
+# ============================================================================
+
+Write-Host "[INFO] Attente de $($config.CleanupDelay) secondes..."
+Start-Sleep -Seconds $config.CleanupDelay
+
+Write-Host "[CLEANUP] Nettoyage..."
+foreach ($taskInfo in $createdTasks) {
+    try {
+        $taskExists = Get-ScheduledTask -TaskName $taskInfo.Name -ErrorAction SilentlyContinue
+        if ($taskExists) {
+            Unregister-ScheduledTask -TaskName $taskInfo.Name -Confirm:$false -ErrorAction Stop
+        }
+        if (Test-Path $taskInfo.ScriptPath) {
+            Remove-Item $taskInfo.ScriptPath -Force -ErrorAction Stop
+        }
+        if (Test-Path $taskInfo.VbsPath) {
+            Remove-Item $taskInfo.VbsPath -Force -ErrorAction Stop
+        }
+    } catch {}
+}
+
+$remainingTasks = Get-ScheduledTask -TaskName "$($config.TaskPrefix)*" -ErrorAction SilentlyContinue
+if ($remainingTasks) {
+    $remainingTasks | ForEach-Object {
+        Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host ""
+Write-Host "[SUCCESS] Notification envoyee a $($createdTasks.Count) utilisateur(s)" -ForegroundColor Green
+Write-Host "[SUCCESS] Nettoyage termine" -ForegroundColor Green
