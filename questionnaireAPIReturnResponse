@@ -32,7 +32,7 @@ Write-Host "ShowForm: $script:showForm"
 
 # Valeurs par défaut
 if ([String]::IsNullOrWhiteSpace($script:title)) { $script:title = "Information" }
-if ([String]::IsNullOrWhiteSpace($script:message)) { $script:message = "Veuillez contacter le service informatique du Client!" }
+if ([String]::IsNullOrWhiteSpace($script:message)) { $script:message = "Veuillez contacter le service informatique!" }
 if ([String]::IsNullOrWhiteSpace($script:showForm)) { $script:showForm = "false" }
 
 # ============================================================================
@@ -167,7 +167,7 @@ function Encode-Url {
 `$headerTitle.Location = New-Object System.Drawing.Point(75, 20)
 `$headerTitle.Size = New-Object System.Drawing.Size(400, 28)
 `$headerTitle.Font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
-`$headerTitle.Text = 'Le Service Informatique du Client'
+`$headerTitle.Text = 'Le Service Informatique'
 `$headerTitle.ForeColor = [System.Drawing.Color]::White
 `$headerTitle.BackColor = [System.Drawing.Color]::Transparent
 `$headerPanel.Controls.Add(`$headerTitle)

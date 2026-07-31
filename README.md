@@ -190,8 +190,8 @@ contexte utilisateur via une tâche planifiée avec `LogonType Interactive`).
   le lancement.
 
 Remarque : la configuration en tête de script (`ScriptFolder`, `TaskPrefix`,
-`ApiBaseUrl`) contient des références à un contexte de déploiement
-spécifique (commune du Client). Ces valeurs sont à adapter à votre
+`ApiBaseUrl`) contient des références à un contexte de déploiement client
+(chemins et libellés génériques `Client*`). Ces valeurs sont à adapter à votre
 environnement avant réutilisation.
 
 ## Utilisation dans NinjaOne
