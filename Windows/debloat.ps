@@ -1,0 +1,534 @@
+<#
+  Debloat PC neufs Lenovo - Commune de Le Roeulx - v6
+  NinjaOne : PowerShell - Windows - Executer en tant que : Systeme - delai conseille : 60 min
+
+  Supprime : McAfee (outil McAfee MCPR, build 10.4.123 silencieux), WebAdvisor, Lenovo Smart Meeting, Lenovo Speech,
+  Lenovo Now, Lenovo Vantage, Smart Connect (Motorola), Office grand public preinstalle
+  (O365HomePremRetail uniquement), Xbox, Widgets, Assistance rapide et les applications
+  grand public Microsoft listees dans $AppxTargets.
+
+  Chaque element est traite independamment : un echec n'empeche jamais les suivants.
+  Code de sortie : 0 = tout est supprime / absent, 1 = au moins un element reste present.
+  Si la sortie indique "REDEMARRAGE REQUIS" : McAfee est desinstalle mais ses derniers fichiers
+  ne disparaissent qu'au redemarrage.
+
+  --- Nouveautes v6 (fiabilite - le coeur du script est inchange / deja valide) ---
+  1. Anti-veille : la machine ne peut plus se mettre en veille pendant l'execution
+     (un portable qui "decroche" en plein script tue l'agent et aucun resultat n'est remonte).
+  2. Transcript sur disque (C:\ProgramData\Debloat-LeRoeulx\debloat.log) : trace consultable
+     meme si l'agent est coupe en cours de route.
+  3. Telechargements MCPR avec -TimeoutSec 120 (evite un blocage si GitHub est filtre par le reseau).
+  4. Option $AutoReboot : redemarrage automatique DIFFERE de 120 s en fin de traitement
+     (differe pour que le resultat remonte a l'outil de gestion AVANT le reboot ; annulable : shutdown /a).
+     Mettre $AutoReboot = $false pour retrouver le comportement d'origine (le script ne redemarre jamais).
+  5. Nettoyage de l'icone McAfee dans la barre des taches : apres MCPR, les services/processus WPS
+     (mc-neo-host, mc-wps-secdashboardservice, mc-fw-host) restent actifs et affichent encore l'icone.
+     Remove-McAfeeResidue les arrete/supprime et retire les dossiers McAfee residuels.
+     De plus, l'icone "fantome" persiste meme APRES redemarrage car Windows 11 la memorise par profil
+     dans HKCU\Control Panel\NotifyIconSettings : Remove-McAfeeTrayIcon retire cette entree pour tous
+     les profils charges et rafraichit la zone de notification. L'icone disparait alors definitivement.
+#>
+
+# Relance en PowerShell 64 bits si l'agent a demarre le script en 32 bits (requis pour Appx/DISM)
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $PSCommandPath) {
+    & "$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+    exit $LASTEXITCODE
+}
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+
+# Redemarrage automatique differe en fin de script (voir en-tete). $false = comportement d'origine.
+$AutoReboot = $true
+
+# Logiciels Win32 : motif sur DisplayName (+ filtre optionnel sur UninstallString) -> arguments silencieux
+$Win32Targets = @(
+    @{ Name = 'WebAdvisor';           Match = 'WebAdvisor';             Args = '/s' }
+    # Smart Meeting 4.2 : le desinstalleur Lenovo exige ludp.dll, absent de l'installation usine -> nettoyage force
+    @{ Name = 'Lenovo Smart Meeting'; Match = '^Lenovo Smart Meeting';  Args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'; ForceCleanup = $true }
+    @{ Name = 'Lenovo Speech';        Match = '^Lenovo Speech';         Args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
+    @{ Name = 'Lenovo Now';           Match = '^Lenovo Now';            Args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
+    # Uninstall.exe de Vantage est un lanceur : il n'accepte que /SILENT (QuietUninstallString fournie par Lenovo)
+    @{ Name = 'Lenovo Vantage';       Match = '^Lenovo Vantage Service'; Args = '/SILENT' }
+    @{ Name = 'Smart Connect';        Match = '^Smart Connect';         Args = '/S' }
+    # Office grand public preinstalle UNIQUEMENT (O365HomePremRetail) - les Office entreprise ne sont pas touches
+    @{ Name = 'Office grand public';  Match = '^Microsoft 365|^Microsoft Office'; UninstallMatch = 'productstoremove=O365HomePremRetail'; Args = 'DisplayLevel=False'; Timeout = 1200 }
+)
+
+# Applications Store (installees pour tous les profils + provisionnees pour les futurs profils)
+$AppxTargets = @(
+    # Xbox
+    'Microsoft.GamingApp', 'Microsoft.XboxApp', 'Microsoft.XboxGamingOverlay', 'Microsoft.XboxGameOverlay',
+    'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.Xbox.TCUI'
+    # McAfee / Lenovo
+    'McAfeeWPSSparsePackage', 'E0469640.LenovoSmartCommunication', 'E046963F.LenovoCompanion'
+    # Widgets, Assistance rapide
+    'MicrosoftWindows.Client.WebExperience', 'MicrosoftCorporationII.QuickAssist'
+    # Applications grand public Microsoft
+    'Clipchamp.Clipchamp', 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.MicrosoftSolitaireCollection',
+    'MicrosoftCorporationII.MicrosoftFamily', 'Microsoft.WindowsFeedbackHub', 'Microsoft.GetHelp',
+    'Microsoft.Windows.DevHome', 'Microsoft.MixedRealityLink', 'Microsoft.PowerAutomateDesktop',
+    'Microsoft.Todos', 'Microsoft.MicrosoftJournal', 'Microsoft.YourPhone', 'MicrosoftWindows.CrossDevice'
+)
+
+# McAfee : outil McAfee Consumer Product Removal (MCPR)
+# - modules de desinstallation recents (dont WPS = McAfee 16.x) : paquet MCPR extrait par Andrew Taylor
+# - mccleanup.exe 10.4.123 : les builds >= 10.5 refusent de tourner hors de leur interface graphique
+#   ("ValidateParentProcess failed", sortie immediate sans rien faire). Binaire signe McAfee, verifie ci-dessous.
+$McprUrl     = 'https://github.com/andrew-s-taylor/public/raw/main/De-Bloat/mccleanup.zip'
+$McprSha256  = '231264F76973F7F9A27AD7A3BD9FEDE8451584968511F320E7FF3B5378E231B4'
+$McExeUrl    = 'https://raw.githubusercontent.com/gnon17/MS-Cloud-Scripts/main/intune/McAfee-Remover/mccleanup.exe'
+$McExeSha256 = '74347C1437A0E711AC300CD9A67BE67E92785C15201A9F445D52D55565878461'
+$McprArgs    = '-p StopServices,MFSY,PEF,MXD,CSP,Sustainability,MOCP,MFP,APPSTATS,AUTH,EMPROXY,FWDRIVER,HW,MAS,MAT,MBK,MCPR,McProxy,McSvcHost,VUL,MHN,MNA,MOBK,MPFP,MPFPCU,MPS,SHRED,MPSCU,MQC,MQCCU,MSAD,shrd,MSK,MSKCU,MWL,NMC,Redir,VS,REMEDIATION,MSC,YAP,TRUEKEY,LAM,PCB,Symlink,SafeConnect,MGS,WPS,MSSPlus,RESIDUE -v -s'
+$McprPasses  = 2    # MCPR relance une 2e fois si la 1re passe est incomplete
+$McAfeeMatch = '^McAfee$|^McAfee LiveSafe|^McAfee Total Protection|^McAfee Security'
+
+$TimeoutSec = 300   # attente max par desinstalleur (sauf Timeout specifique)
+$SettleSec  = 120   # attente max que l'entree disparaisse du registre apres le desinstalleur
+$WorkDir    = 'C:\ProgramData\Debloat-LeRoeulx'
+$script:RebootNeeded = $false
+
+# ---------------------------------------------------------------------------
+# FONCTIONS
+# ---------------------------------------------------------------------------
+
+function Log($msg) { Write-Output ("{0} - {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg) }
+
+function Get-Win32 {
+    $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.UninstallString }
+}
+
+function Find-Win32($t) {
+    Get-Win32 | Where-Object {
+        $_.DisplayName -match $t.Match -and (-not $t.UninstallMatch -or $_.UninstallString -match $t.UninstallMatch)
+    }
+}
+
+function Split-Command([string]$cmd) {
+    # Retourne @(exe, arguments) a partir d'une UninstallString, ou $null si illisible
+    $cmd = $cmd.Trim()
+    if ($cmd.StartsWith('"')) {
+        $end = $cmd.IndexOf('"', 1)
+        if ($end -lt 2) { return $null }
+        return @($cmd.Substring(1, $end - 1), $cmd.Substring($end + 1).Trim())
+    }
+    $idx = $cmd.ToLower().IndexOf('.exe')
+    if ($idx -gt 0) { return @($cmd.Substring(0, $idx + 4), $cmd.Substring($idx + 4).Trim()) }
+    return $null
+}
+
+function Invoke-Uninstall([string]$exe, [string]$arguments, [int]$timeout = $TimeoutSec) {
+    if ($exe -ne 'msiexec.exe' -and -not (Test-Path -LiteralPath $exe)) {
+        Log "  ! programme introuvable : $exe"
+        return
+    }
+    Log "  > `"$exe`" $arguments"
+    $p = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Hidden -ErrorAction Stop
+    if (-not $p.WaitForExit($timeout * 1000)) {
+        Log "  ! delai depasse ($timeout s), arret du processus"
+        $p | Stop-Process -Force -ErrorAction SilentlyContinue
+        return
+    }
+    Log "  code retour : $($p.ExitCode)"
+}
+
+function Stop-AppFolder([string]$dir) {
+    # Arrete services et processus lances depuis le dossier du logiciel
+    # (sinon l'uninstalleur Inno abandonne en silence avec le code 1 : application en cours d'utilisation)
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return }
+    $dir = $dir.TrimEnd('\')
+    # Garde-fou : jamais un dossier racine type "C:\Program Files\Lenovo" (au moins 3 niveaux)
+    if (($dir.ToCharArray() | Where-Object { $_ -eq '\' }).Count -lt 3) { return }
+    $dir = $dir + '\'
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.PathName -and $_.PathName.Trim('"').StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object {
+            Log "  arret du service $($_.Name)"
+            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+        }
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object {
+            Log "  arret du processus $($_.Name)"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+}
+
+function Get-AppDir($app) {
+    # Dossier du logiciel : InstallLocation, sinon dossier de l'uninstalleur (remonte d'un niveau si dossier de version)
+    if ($app.InstallLocation) { return $app.InstallLocation }
+    $parts = Split-Command $app.UninstallString
+    if (-not $parts) { return $null }
+    $dir = Split-Path $parts[0] -Parent
+    if ((Split-Path $dir -Leaf) -match '^\d+(\.\d+)+$') { $dir = Split-Path $dir -Parent }
+    return $dir
+}
+
+function Remove-Forced($app) {
+    # Nettoyage force quand le desinstalleur de l'editeur est inutilisable :
+    # services, taches planifiees, demarrage auto, raccourcis, dossier, entree "Programmes"
+    $dir = Get-AppDir $app
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { Log "  ! nettoyage force : dossier introuvable ($dir)"; return }
+    $dir = $dir.TrimEnd('\')
+    if (($dir.ToCharArray() | Where-Object { $_ -eq '\' }).Count -lt 3) { Log "  ! nettoyage force refuse : dossier trop general ($dir)"; return }
+    $prefix = $dir + '\'
+    Log "  nettoyage force de $dir"
+    Stop-AppFolder $dir
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.PathName -and $_.PathName.Trim('"').StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { & sc.exe delete $_.Name | Out-Null; Log "  service supprime : $($_.Name)" }
+    Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { $_.Actions | Where-Object { $_.Execute -and $_.Execute.Trim('"').StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } } |
+        ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false -ErrorAction SilentlyContinue; Log "  tache planifiee supprimee : $($_.TaskName)" }
+    foreach ($run in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run') {
+        $props = Get-ItemProperty $run -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        $props.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' -and "$($_.Value)" -like "*$dir*" } |
+            ForEach-Object { Remove-ItemProperty $run -Name $_.Name -ErrorAction SilentlyContinue; Log "  demarrage auto supprime : $($_.Name)" }
+    }
+    $sh = New-Object -ComObject WScript.Shell
+    Get-ChildItem 'C:\ProgramData\Microsoft\Windows\Start Menu', 'C:\Users\Public\Desktop' -Recurse -Filter *.lnk -ErrorAction SilentlyContinue |
+        Where-Object { $sh.CreateShortcut($_.FullName).TargetPath -like "$prefix*" } |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; Log "  raccourci supprime : $($_.Name)" }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $dir) { Log "  ! fichiers verrouilles restants dans $dir (supprimes au prochain nettoyage)" }
+    Remove-Item -LiteralPath $app.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+    Log "  entree Programmes supprimee"
+}
+
+function Wait-Removed($t) {
+    # Certains desinstalleurs rendent la main avant la fin : attendre la disparition de l'entree
+    $deadline = (Get-Date).AddSeconds($SettleSec)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Find-Win32 $t)) { return $true }
+        Start-Sleep -Seconds 10
+    }
+    return $false
+}
+
+function Remove-McAfeeResidue {
+    # Apres MCPR, l'entree "Programmes" est partie mais les services/processus/dossiers McAfee WPS
+    # restent et maintiennent l'icone dans la barre des taches (mc-neo-host = tableau de bord).
+    # On arrete puis supprime ces services + processus, puis les dossiers. Les fichiers verrouilles
+    # par le pilote pare-feu (mc-fw) ne disparaissent qu'au redemarrage.
+    $mcDirs = 'C:\Program Files\McAfee', 'C:\Program Files (x86)\McAfee', 'C:\ProgramData\McAfee', 'C:\Program Files\Common Files\McAfee'
+
+    # Services McAfee (mc-fw-host, mc-wps-secdashboardservice, mc-wps-update, ...) : desactivation + arret + suppression
+    # IMPORTANT : desactiver (start= disabled) AVANT d'arreter, sinon le SCM relance aussitot le service
+    # (mc-fw-host est en Auto) et celui-ci RE-CREE son icone dans NotifyIconSettings -> l'icone "revient".
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^mc-' -or $_.PathName -match '\\McAfee\\' } |
+        ForEach-Object {
+            Log "  service McAfee : desactivation/arret/suppression de $($_.Name)"
+            & sc.exe config $_.Name start= disabled | Out-Null
+            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+            & sc.exe stop   $_.Name | Out-Null
+            & sc.exe delete $_.Name | Out-Null
+        }
+
+    # Processus McAfee encore actifs (dont mc-neo-host = icone / tableau de bord)
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -match '\\McAfee\\' -or $_.Name -match '^mc-' } |
+        ForEach-Object {
+            Log "  processus McAfee : arret de $($_.Name)"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+
+    Start-Sleep -Seconds 3   # laisser les handles se liberer avant suppression des dossiers
+
+    foreach ($d in $mcDirs) {
+        if (Test-Path -LiteralPath $d) {
+            Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $d) { Log "  ! fichiers McAfee verrouilles restants dans $d (retires au redemarrage)" }
+            else { Log "  dossier McAfee supprime : $d" }
+        }
+    }
+
+    $sm = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\McAfee'
+    if (Test-Path $sm) { Remove-Item $sm -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # Icone residuelle dans la barre des taches (persiste meme APRES redemarrage)
+    Remove-McAfeeTrayIcon
+}
+
+function Remove-McAfeeTrayIcon {
+    # Supprime l'icone McAfee de la barre des taches, y compris l'icone "fantome" qui reste
+    # affichee APRES redemarrage. Windows 11 memorise chaque icone, par profil utilisateur, dans
+    #   HKCU\Control Panel\NotifyIconSettings\<id>  (valeur ExecutablePath = programme de l'icone).
+    # Tant que la sous-cle existe, l'icone est reaffichee a chaque ouverture de session, que le
+    # programme soit encore installe ou non. On retire donc toute sous-cle dont l'ExecutablePath
+    # pointe vers McAfee, pour tous les profils charges (HKEY_USERS).
+    $removed = 0
+    Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21' -and $_.PSChildName -notmatch '_Classes$' } |
+        ForEach-Object {
+            $sid  = $_.PSChildName
+            $base = "Registry::HKEY_USERS\$sid\Control Panel\NotifyIconSettings"
+            if (Test-Path $base) {
+                Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+                    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                    if ("$($p.ExecutablePath)" -match 'McAfee|\\mc-') {
+                        Log "  icone barre des taches supprimee : $($p.ExecutablePath)"
+                        Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                        $removed++
+                    }
+                }
+            }
+            # Cache legacy (anciennes versions de Windows) : purge si present
+            $tn = "Registry::HKEY_USERS\$sid\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify"
+            if (Test-Path $tn) { Remove-ItemProperty $tn -Name IconStreams, PastIconsStream -ErrorAction SilentlyContinue }
+        }
+    if ($removed -gt 0) {
+        # Rafraichir la zone de notification : sinon l'icone reste a l'ecran jusqu'au prochain logon
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Log "  $removed icone(s) McAfee retiree(s) - zone de notification rafraichie"
+    } else {
+        Log "  aucune icone McAfee residuelle dans les profils charges"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# AMELIORATIONS FIABILITE (v6) - empeche la veille + journalise sur disque
+# ---------------------------------------------------------------------------
+New-Item -Path $WorkDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+
+# Empeche la mise en veille / veille prolongee pendant toute l'execution
+# (les portables qui "decrochent" en plein script tuent l'agent -> aucun resultat remonte)
+$ES_CONTINUOUS = [uint32]'0x80000000'
+try {
+    Add-Type -Name Power -Namespace Win32Debloat -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+} catch {}
+# ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+try { [void][Win32Debloat.Power]::SetThreadExecutionState(0x80000003) } catch {}
+
+# Transcript sur disque : trace consultable meme si l'agent est coupe en cours de route
+try { Start-Transcript -Path (Join-Path $WorkDir 'debloat.log') -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+Log "=== Debloat sur $env:COMPUTERNAME ==="
+New-Item -Path $WorkDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+
+# ---------------------------------------------------------------------------
+# 1. Logiciels Win32
+# ---------------------------------------------------------------------------
+foreach ($t in $Win32Targets) {
+    try {
+        $apps = @(Find-Win32 $t)
+        if (-not $apps) { Log "[$($t.Name)] absent"; continue }
+        $timeout = if ($t.Timeout) { $t.Timeout } else { $TimeoutSec }
+        foreach ($app in $apps) {
+            try {
+                Log "[$($t.Name)] $($app.DisplayName) $($app.DisplayVersion)"
+                if ($app.UninstallString -match 'msiexec') {
+                    Invoke-Uninstall 'msiexec.exe' "/x $($app.PSChildName) /qn /norestart" $timeout
+                } else {
+                    $parts = Split-Command $app.UninstallString
+                    if (-not $parts) { Log "  ! commande de desinstallation illisible : $($app.UninstallString)"; continue }
+                    if ($t.Name -ne 'Office grand public') { Stop-AppFolder (Get-AppDir $app) }
+                    Invoke-Uninstall $parts[0] ("$($parts[1]) $($t.Args)").Trim() $timeout
+                }
+            } catch {
+                Log "  ! erreur sur $($app.DisplayName) : $($_.Exception.Message)"
+            }
+        }
+        if (Wait-Removed $t) {
+            Log "[$($t.Name)] supprime"
+        } elseif ($t.ForceCleanup) {
+            Log "[$($t.Name)] desinstalleur de l'editeur inoperant"
+            foreach ($app in @(Find-Win32 $t)) {
+                try { Remove-Forced $app } catch { Log "  ! nettoyage force : $($_.Exception.Message)" }
+            }
+            if (Find-Win32 $t) { Log "[$($t.Name)] ! toujours present" } else { Log "[$($t.Name)] supprime (nettoyage force)" }
+        } else {
+            Log "[$($t.Name)] ! toujours present"
+        }
+    } catch {
+        Log "[$($t.Name)] ! erreur : $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 2. McAfee (WPS / LiveSafe) via MCPR
+# ---------------------------------------------------------------------------
+try {
+    $mcafee = @(Get-Win32 | Where-Object { $_.DisplayName -match $McAfeeMatch })
+    $wpsDir = Test-Path 'C:\Program Files\McAfee\wps'
+    if (-not $mcafee -and -not $wpsDir) {
+        Log "[McAfee] absent"
+    } else {
+        Log "[McAfee] detecte : $(($mcafee | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" }) -join ', ')"
+        $zip  = Join-Path $WorkDir 'mccleanup.zip'
+        $mcpr = Join-Path $WorkDir 'mcpr'
+        $old  = Join-Path $WorkDir 'mccleanup-10.4.exe'
+        Log "  telechargement de l'outil MCPR"
+        Invoke-WebRequest -Uri $McprUrl -OutFile $zip -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        Invoke-WebRequest -Uri $McExeUrl -OutFile $old -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        $hZip = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+        $hExe = (Get-FileHash -Path $old -Algorithm SHA256).Hash
+        $sig  = Get-AuthenticodeSignature -FilePath $old
+        if ($hZip -ne $McprSha256) {
+            Log "  ! empreinte du paquet MCPR inattendue ($hZip) : outil NON execute"
+        } elseif ($hExe -ne $McExeSha256 -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'McAfee') {
+            Log "  ! mccleanup.exe non conforme (empreinte $hExe, signature $($sig.Status)) : outil NON execute"
+        } else {
+            if (Test-Path $mcpr) { Remove-Item $mcpr -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $zip -DestinationPath $mcpr -Force
+            $exe = Join-Path $mcpr 'mccleanup.exe'
+            Copy-Item $old $exe -Force
+            Log "  mccleanup.exe $((Get-Item $exe).VersionInfo.FileVersion), signature McAfee valide"
+            for ($i = 1; $i -le $McprPasses; $i++) {
+                Log "  > MCPR passe $i (silencieux, 2 a 10 minutes)"
+                $p = Start-Process -FilePath $exe -ArgumentList $McprArgs -WorkingDirectory $mcpr -PassThru -WindowStyle Hidden -ErrorAction Stop
+                if (-not $p.WaitForExit(1200 * 1000)) {
+                    Log "  ! MCPR depasse 20 min, arret"
+                    $p | Stop-Process -Force -ErrorAction SilentlyContinue
+                    break
+                }
+                Log "  code retour MCPR : $($p.ExitCode)"
+                $logFile = Join-Path $mcpr 'mccleanup.log'
+                if ((Test-Path $logFile) -and (Select-String -Path $logFile -Pattern 'ValidateParentProcess failed' -Quiet)) {
+                    Log "  ! MCPR a refuse de demarrer (ValidateParentProcess) : build incompatible"
+                    break
+                }
+                if ($p.ExitCode -eq 0) { break }
+                Start-Sleep -Seconds 15
+            }
+            $entree = @(Get-Win32 | Where-Object { $_.DisplayName -match $McAfeeMatch })
+            $mcRestes = (Test-Path 'C:\Program Files\McAfee\wps') -or (Get-Service 'mc-wps-update', 'mc-fw-host' -ErrorAction SilentlyContinue)
+            if (-not $entree -and -not $mcRestes) {
+                foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\McAfee.WPS',
+                               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\McAfee.WPS') {
+                    if (Test-Path $k) { Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue; Log "  entree residuelle supprimee : $k" }
+                }
+                $sm = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\McAfee'
+                if (Test-Path $sm) { Remove-Item $sm -Recurse -Force -ErrorAction SilentlyContinue }
+                Log "[McAfee] supprime"
+            } elseif (-not $entree) {
+                # Entree desinstallee mais services/processus/dossiers WPS restants (= icone barre des taches)
+                Log "[McAfee] entree desinstallee - nettoyage des restes WPS (services / processus / icone)"
+                Remove-McAfeeResidue
+                $wpsLeft = (Test-Path 'C:\Program Files\McAfee\wps') -or (Test-Path 'C:\ProgramData\McAfee\wps') -or `
+                           (Get-Service 'mc-fw-host', 'mc-wps-update', 'mc-wps-secdashboardservice', 'mc-neo-host' -ErrorAction SilentlyContinue)
+                if ($wpsLeft) {
+                    $script:RebootNeeded = $true
+                    Log "[McAfee] desinstalle - icone retiree, REDEMARRAGE REQUIS pour supprimer les derniers fichiers verrouilles"
+                } else {
+                    Log "[McAfee] supprime (restes WPS et icone nettoyes, sans redemarrage)"
+                }
+            } else {
+                Log "[McAfee] ! toujours present - redemarrer puis relancer le script"
+            }
+        }
+    }
+} catch {
+    Log "[McAfee] ! erreur : $($_.Exception.Message)"
+} finally {
+    Remove-Item (Join-Path $WorkDir 'mccleanup.zip'), (Join-Path $WorkDir 'mccleanup-10.4.exe') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $WorkDir 'mcpr') -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# 3. Applications Store
+# ---------------------------------------------------------------------------
+$provAll = @()
+try { $provAll = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch { Log "[Appx] ! lecture des paquets provisionnes impossible : $($_.Exception.Message)" }
+
+foreach ($name in $AppxTargets) {
+    try {
+        # Deprovisionner AVANT de supprimer : Remove-AppxPackage -AllUsers efface les fichiers du paquet
+        # et le deprovisionnement echoue ensuite avec "fichier introuvable"
+        $prov = @($provAll | Where-Object { $_.DisplayName -eq $name })
+        foreach ($p in $prov) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -AllUsers -ErrorAction Stop | Out-Null
+                Log "[Appx] deprovisionne : $($p.DisplayName)"
+            } catch {
+                Log "[Appx] ! echec deprovisionnement $($p.DisplayName) : $($_.Exception.Message)"
+            }
+        }
+        $pkgs = @(Get-AppxPackage -AllUsers -Name $name -ErrorAction SilentlyContinue | Where-Object { -not $_.NonRemovable })
+        foreach ($pkg in $pkgs) {
+            try {
+                # Fermer l'application si elle tourne (sinon suppression differee)
+                Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $pkg.InstallLocation -and $_.Path.StartsWith($pkg.InstallLocation, [StringComparison]::OrdinalIgnoreCase) } |
+                    Stop-Process -Force -ErrorAction SilentlyContinue
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                Log "[Appx] supprime : $($pkg.Name)"
+            } catch {
+                Log "[Appx] ! echec $($pkg.Name) : $($_.Exception.Message)"
+            }
+        }
+        if (-not $pkgs -and -not $prov) { Log "[Appx] $name absent" }
+    } catch {
+        Log "[Appx] ! erreur sur $name : $($_.Exception.Message)"
+    }
+}
+
+# Assistance rapide en composant Windows (anciennes versions de Windows)
+try {
+    Get-WindowsCapability -Online -ErrorAction Stop | Where-Object { $_.Name -like 'App.Support.QuickAssist*' -and $_.State -eq 'Installed' } |
+        ForEach-Object { Remove-WindowsCapability -Online -Name $_.Name -ErrorAction Stop | Out-Null; Log "[QuickAssist] composant Windows retire" }
+} catch {
+    Log "[QuickAssist] ! composant Windows : $($_.Exception.Message)"
+}
+
+# Widgets : desactivation par strategie (empeche aussi la reapparition)
+# Sur Windows 11 26H2 la cle Dsh est protegee (ecriture refusee meme en SYSTEM) : non bloquant,
+# le paquet Widgets (WebExperience) est de toute facon supprime et deprovisionne ci-dessus.
+$dshOut = & reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\Dsh' /v AllowNewsAndInterests /t REG_DWORD /d 0 /f 2>&1
+if ($LASTEXITCODE -eq 0) { Log "[Widgets] strategie de desactivation appliquee" }
+else { Log "[Widgets] info : strategie non modifiable sur ce Windows ($(("$dshOut").Trim())) - Widgets supprime via le paquet" }
+
+# ---------------------------------------------------------------------------
+# 4. Verification finale
+# ---------------------------------------------------------------------------
+Log "=== Verification ==="
+$reste = @()
+foreach ($t in $Win32Targets) { Find-Win32 $t | ForEach-Object { $reste += "Win32 : $($_.DisplayName)" } }
+$mcEntree = @(Get-Win32 | Where-Object { $_.DisplayName -match $McAfeeMatch })
+$mcEntree | ForEach-Object { $reste += "McAfee : $($_.DisplayName)" }
+if (Test-Path 'C:\Program Files\McAfee\wps') {
+    # Entree "Programmes" partie = desinstalle, le dossier disparait au redemarrage
+    if ($mcEntree) { $reste += 'McAfee : dossier C:\Program Files\McAfee\wps encore present' } else { $script:RebootNeeded = $true }
+}
+$provAll = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+foreach ($name in $AppxTargets) {
+    Get-AppxPackage -AllUsers -Name $name -ErrorAction SilentlyContinue | Where-Object { -not $_.NonRemovable } |
+        ForEach-Object { $reste += "Appx : $($_.Name)" }
+    $provAll | Where-Object { $_.DisplayName -eq $name } | ForEach-Object { $reste += "Appx provisionne : $($_.DisplayName)" }
+}
+
+$exitCode = 0
+if ($reste) {
+    Log "RESTE PRESENT :"
+    $reste | ForEach-Object { Log "  - $_" }
+    $exitCode = 1
+} elseif ($script:RebootNeeded) {
+    Log "OK - tout est desinstalle. REDEMARRAGE REQUIS pour finaliser McAfee (relancer le script apres pour verifier)."
+} else {
+    Log "OK - tout est supprime. Redemarrage recommande."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Cloture : redemarrage differe optionnel + fin du journal + reautorisation veille
+# ---------------------------------------------------------------------------
+# Le redemarrage est DIFFERE de 120 s : le script rend d'abord son resultat a l'outil de gestion
+# (code de sortie + journal), PUIS Windows redemarre. Annulable avec : shutdown /a
+if ($AutoReboot) {
+    Log "Redemarrage automatique programme dans 120 s (annulable avec : shutdown /a)"
+    & shutdown.exe /r /t 120 /c "Finalisation du debloat - Commune de Le Roeulx" 2>&1 | Out-Null
+}
+
+# Autoriser de nouveau la mise en veille + cloturer le transcript
+try { [void][Win32Debloat.Power]::SetThreadExecutionState($ES_CONTINUOUS) } catch {}
+try { Stop-Transcript | Out-Null } catch {}
+exit $exitCode
