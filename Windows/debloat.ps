@@ -525,7 +525,7 @@ if ($reste) {
 # (code de sortie + journal), PUIS Windows redemarre. Annulable avec : shutdown /a
 if ($AutoReboot) {
     Log "Redemarrage automatique programme dans 120 s (annulable avec : shutdown /a)"
-    & shutdown.exe /r /t 120 /c "Finalisation du debloat - Commune de Le Roeulx" 2>&1 | Out-Null
+    & shutdown.exe /r /t 120 /c "Finalisation du debloat" 2>&1 | Out-Null
 }
 
 # Autoriser de nouveau la mise en veille + cloturer le transcript
